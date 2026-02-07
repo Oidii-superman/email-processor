@@ -27,16 +27,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Debug Secrets (Temporary)
+      - name: Check if secrets are set
         run: |
-          echo "IMAP_SERVER=$IMAP_SERVER"
-          echo "IMAP_PORT=$IMAP_PORT"
-          echo "IMAP_USER=$IMAP_USER"
-          echo "IMAP_PASSWORD=$IMAP_PASSWORD"
-          echo "GOOGLE_API_KEY=$GOOGLE_API_KEY"
-          echo "GCP_PROJECT_ID=$GCP_PROJECT_ID"
-          echo "BIGQUERY_DATASET=$BIGQUERY_DATASET"
-          echo "GCP_SERVICE_ACCOUNT_JSON=$GCP_SERVICE_ACCOUNT_JSON"
+          for secret in IMAP_SERVER IMAP_PORT IMAP_USER IMAP_PASSWORD GOOGLE_API_KEY GCP_PROJECT_ID BIGQUERY_DATASET GCP_SERVICE_ACCOUNT_JSON; do
+            if [ -z "${!secret}" ]; then
+              echo "$secret is empty"
+          else
+            echo "$secret is set"
+          fi
 
       - name: Run email processor
         env:
