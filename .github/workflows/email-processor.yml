@@ -29,12 +29,14 @@ jobs:
 
       - name: Check if secrets are set
         run: |
-          for secret in IMAP_SERVER IMAP_PORT IMAP_USER IMAP_PASSWORD GOOGLE_API_KEY GCP_PROJECT_ID BIGQUERY_DATASET GCP_SERVICE_ACCOUNT_JSON; do
+          for secret in IMAP_SERVER IMAP_PORT IMAP_USER IMAP_PASSWORD GOOGLE_API_KEY GCP_PROJECT_ID BIGQUERY_DATASET GCP_SERVICE_ACCOUNT_JSON
+          do
             if [ -z "${!secret}" ]; then
               echo "$secret is empty"
           else
             echo "$secret is set"
           fi
+          done
 
       - name: Run email processor
         env:
