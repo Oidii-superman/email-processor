@@ -1,0 +1,45 @@
+name: Email Processor (Cron)
+
+on:
+  schedule:
+    # 平日（月〜金）9:00〜20:00 JST
+    # GitHub Actions は UTC なので JST-9時間
+    # 9:00 JST = 0:00 UTC
+    # 20:00 JST = 11:00 UTC
+    - cron: "*/5 0-11 * * 1-5"
+  workflow_dispatch:  # 手動実行用（デバッグに便利）
+
+jobs:
+  run-email-processor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run email processor
+        env:
+          IMAP_SERVER: ${{ secrets.IMAP_SERVER }}
+          IMAP_PORT: ${{ secrets.IMAP_PORT }}
+          IMAP_USER: ${{ secrets.IMAP_USER }}
+          IMAP_PASSWORD: ${{ secrets.IMAP_PASSWORD }}
+
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          BIGQUERY_DATASET: ${{ secrets.BIGQUERY_DATASET }}
+          GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+        run: |
+          python scripts/process_all_emails.py
+
+これを貼り付けた
