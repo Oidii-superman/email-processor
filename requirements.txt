@@ -1,0 +1,5 @@
+google-generativeai
+google-cloud-bigquery
+openpyxl
+python-dotenv
+google-auth

@@ -1,0 +1,23 @@
+# Environment variables
+.env
+env.yaml
+
+# Credentials
+credentials.json
+service-account-key.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+__MACOSX/
+
+# Application Data
+data/
+node_modules/
