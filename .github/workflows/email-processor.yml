@@ -27,28 +27,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Check if secrets are set
-        env:
-            IMAP_SERVER: ${{ secrets.IMAP_SERVER }}
-            IMAP_PORT: ${{ secrets.IMAP_PORT }}
-            IMAP_USER: ${{ secrets.IMAP_USER }}
-            IMAP_PASSWORD: ${{ secrets.IMAP_PASSWORD }}
-  
-            GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-  
-            GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-            BIGQUERY_DATASET: ${{ secrets.BIGQUERY_DATASET }}
-            GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
-        run: |
-          for secret in IMAP_SERVER IMAP_PORT IMAP_USER IMAP_PASSWORD GOOGLE_API_KEY GCP_PROJECT_ID BIGQUERY_DATASET GCP_SERVICE_ACCOUNT_JSON
-          do
-            if [ -z "${!secret}" ]; then
-              echo "$secret is empty"
-          else
-            echo "$secret is set"
-          fi
-          done
-
       - name: Run email processor
         env:
           IMAP_SERVER: ${{ secrets.IMAP_SERVER }}
