@@ -36,8 +36,14 @@ from io import BytesIO
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
-GCP_PROJECT_ID = os.getenv('GCP_PROJECT_ID', 'gen-lang-client-0092830518')
-BIGQUERY_DATASET = os.getenv('BIGQUERY_DATASET', 'gmailData')
+GCP_PROJECT_ID = os.getenv('GCP_PROJECT_ID')
+BIGQUERY_DATASET = os.getenv('BIGQUERY_DATASET')
+if not GCP_PROJECT_ID:
+    raise RuntimeError("GCP_PROJECT_ID is not set")
+
+if not BIGQUERY_DATASET:
+    raise RuntimeError("BIGQUERY_DATASET is not set")
+
 BIGQUERY_TABLE_ENGINEERS = 'EngineerData'
 BIGQUERY_TABLE_PROJECTS = 'ProjectData'
 
