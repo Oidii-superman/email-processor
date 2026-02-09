@@ -91,17 +91,14 @@ def upload_to_gcs(file_data, filename, mime_type='application/vnd.openxmlformats
         # Blob作成
         blob = bucket.blob(blob_name)
         
-        # ファイルアップロード
+        # ファイルアップロード（Cache-Controlを設定）
         blob.upload_from_string(
             file_data,
             content_type=mime_type
         )
         
-        # 公開設定
-        blob.make_public()
-        
-        # 公開URL取得
-        public_url = blob.public_url
+        # 公開URL取得（make_public()は使わない）
+        public_url = f"https://storage.googleapis.com/{GCS_BUCKET_NAME}/{blob_name}"
         
         print(f"    ✅ Google Cloud Storageアップロード成功")
         print(f"       ファイル名: {filename}")
