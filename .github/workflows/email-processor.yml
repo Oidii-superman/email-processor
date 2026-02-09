@@ -2,11 +2,7 @@ name: Email Processor (Cron)
 
 on:
   schedule:
-    # 平日（月〜金）9:00〜20:00 JST
-    # GitHub Actions は UTC なので JST-9時間
-    # 9:00 JST = 0:00 UTC
-    # 20:00 JST = 11:00 UTC
-    - cron: "*/5 0-11 * * 1-5"
+    - cron: "*/5 * * * *"
   workflow_dispatch:  # 手動実行用（デバッグに便利）
 
 jobs:
