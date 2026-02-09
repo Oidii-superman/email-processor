@@ -1,6 +1,6 @@
 """
-メール処理統合スクリプト（重複防止機能付き）
-IMAP → Gemini解析 → BigQuery挿入
+メール処理統合スクリプト（重複防止機能付き + Google Driveアップロード - OAuth版）
+IMAP → Gemini解析 → BigQuery挿入 + 添付ファイルをGoogle Driveに保存
 """
 import sys
 import os
@@ -13,6 +13,7 @@ import json
 import re
 import hashlib
 from datetime import datetime, timezone
+import pickle
 
 # 環境変数読み込み
 load_dotenv()
@@ -32,28 +33,157 @@ genai.configure(api_key=GOOGLE_API_KEY)
 import openpyxl
 from io import BytesIO
 
-# BigQuery
+# BigQuery（サービスアカウント認証）
 from google.cloud import bigquery
 from google.oauth2 import service_account
+
+# Google Drive API（OAuth認証）
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
 
 GCP_PROJECT_ID = os.getenv('GCP_PROJECT_ID', 'gen-lang-client-0092830518')
 BIGQUERY_DATASET = os.getenv('BIGQUERY_DATASET', 'gmailData')
 BIGQUERY_TABLE_ENGINEERS = 'EngineerData'
 BIGQUERY_TABLE_PROJECTS = 'ProjectData'
 
-# BigQuery認証（GitHub Actions対応）
+# Google Drive設定
+GOOGLE_DRIVE_FOLDER_ID = os.getenv('GOOGLE_DRIVE_FOLDER_ID')
+
+# OAuth認証のスコープ
+SCOPES = ['https://www.googleapis.com/auth/drive.file']
+
+# BigQuery認証（サービスアカウント）
 gcp_json_str = os.getenv('GCP_SERVICE_ACCOUNT_JSON')
 if gcp_json_str:
-    # GitHub Actionsの場合（JSON文字列）
-    credentials = service_account.Credentials.from_service_account_info(
+    credentials_bq = service_account.Credentials.from_service_account_info(
         json.loads(gcp_json_str)
     )
 else:
-    # ローカルの場合（JSONファイル）
     GOOGLE_APPLICATION_CREDENTIALS = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
-    credentials = service_account.Credentials.from_service_account_file(
+    credentials_bq = service_account.Credentials.from_service_account_file(
         GOOGLE_APPLICATION_CREDENTIALS
     )
+
+
+def get_drive_credentials():
+    """
+    Google Drive用のOAuth認証を取得
+    初回実行時はブラウザで認証、2回目以降はtoken.pickleを使用
+    """
+    creds = None
+    
+    # token.pickleファイルがあれば読み込む
+    if os.path.exists('token.pickle'):
+        with open('token.pickle', 'rb') as token:
+            creds = pickle.load(token)
+    
+    # 認証情報が無効または存在しない場合
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            # トークンをリフレッシュ
+            creds.refresh(Request())
+        else:
+            # 新規認証（credentials.jsonが必要）
+            if not os.path.exists('credentials.json'):
+                print("❌ エラー: credentials.jsonファイルが見つかりません")
+                print("Google Cloud Consoleから OAuth 2.0 クライアントIDの認証情報をダウンロードしてください")
+                print("https://console.cloud.google.com/apis/credentials")
+                return None
+            
+            flow = InstalledAppFlow.from_client_secrets_file(
+                'credentials.json', SCOPES)
+            creds = flow.run_local_server(port=0)
+        
+        # 認証情報を保存
+        with open('token.pickle', 'wb') as token:
+            pickle.dump(creds, token)
+    
+    return creds
+
+
+def upload_to_google_drive(file_data, filename, mime_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'):
+    """
+    Google Driveにファイルをアップロードして共有URLを取得（OAuth版）
+    
+    Args:
+        file_data: ファイルのバイナリデータ
+        filename: ファイル名
+        mime_type: MIMEタイプ（デフォルトはExcel）
+    
+    Returns:
+        共有可能なURL（成功時）/ None（失敗時）
+    """
+    try:
+        # OAuth認証取得
+        creds = get_drive_credentials()
+        if not creds:
+            return None
+        
+        # ファイル名をUTF-8で正規化（文字化け対策）
+        if isinstance(filename, bytes):
+            filename = filename.decode('utf-8', errors='ignore')
+        
+        # ファイル名を正規化（NFCフォーム）
+        import unicodedata
+        filename = unicodedata.normalize('NFC', filename)
+        
+        # Drive APIサービス構築
+        drive_service = build('drive', 'v3', credentials=creds)
+        
+        # ファイルメタデータ
+        file_metadata = {
+            'name': filename,
+            'mimeType': mime_type
+        }
+        
+        # アップロード先フォルダを指定する場合
+        if GOOGLE_DRIVE_FOLDER_ID:
+            file_metadata['parents'] = [GOOGLE_DRIVE_FOLDER_ID]
+        
+        # ファイルデータをメモリストリームに変換
+        media = MediaIoBaseUpload(
+            BytesIO(file_data),
+            mimetype=mime_type,
+            resumable=True
+        )
+        
+        # ファイルアップロード
+        file = drive_service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id, webViewLink'
+        ).execute()
+        
+        file_id = file.get('id')
+        
+        # 誰でも閲覧可能に設定（リンクを知っている人全員）
+        permission = {
+            'type': 'anyone',
+            'role': 'reader'
+        }
+        
+        drive_service.permissions().create(
+            fileId=file_id,
+            body=permission
+        ).execute()
+        
+        # 共有URL取得
+        web_view_link = file.get('webViewLink')
+        
+        print(f"    ✅ Google Driveアップロード成功")
+        print(f"       ファイル名: {filename}")
+        print(f"       ファイルID: {file_id}")
+        print(f"       URL: {web_view_link}")
+        
+        return web_view_link
+        
+    except Exception as e:
+        print(f"    ❌ Google Driveアップロードエラー: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 def generate_mail_fingerprint(sender_email, subject, body, sent_at):
@@ -69,18 +199,13 @@ def generate_mail_fingerprint(sender_email, subject, body, sent_at):
     Returns:
         SHA-256ハッシュ文字列（64文字）
     """
-    # 本文は先頭500文字のみ使用（署名・フッター差分を吸収）
     body_part = body[:500] if body else ""
-    
-    # 結合して一意の文字列を作成
     base = f"{sender_email}|{subject}|{body_part}|{sent_at}"
-    
-    # SHA-256ハッシュ化
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
 
 def decode_mime_header(header_text):
-    """MIMEヘッダーをデコード"""
+    """MIMEヘッダーをデコード（文字化け対策強化版）"""
     if not header_text:
         return ''
     
@@ -89,10 +214,28 @@ def decode_mime_header(header_text):
     
     for part, encoding in decoded_parts:
         if isinstance(part, bytes):
-            try:
-                decoded_text += part.decode(encoding or 'utf-8', errors='ignore')
-            except:
-                decoded_text += part.decode('iso-2022-jp', errors='ignore')
+            # エンコーディングの優先順位リスト
+            encodings_to_try = []
+            
+            if encoding:
+                encodings_to_try.append(encoding.lower())
+            
+            # 日本語によくあるエンコーディングを追加
+            encodings_to_try.extend(['utf-8', 'iso-2022-jp', 'shift_jis', 'euc-jp', 'cp932'])
+            
+            # 各エンコーディングを試す
+            decoded = False
+            for enc in encodings_to_try:
+                try:
+                    decoded_text += part.decode(enc, errors='strict')
+                    decoded = True
+                    break
+                except (UnicodeDecodeError, LookupError):
+                    continue
+            
+            # すべて失敗した場合はUTF-8でエラー無視
+            if not decoded:
+                decoded_text += part.decode('utf-8', errors='ignore')
         else:
             decoded_text += str(part)
     
@@ -106,7 +249,6 @@ def fetch_recent_emails(limit=50):
         mail.login(IMAP_USER, IMAP_PASSWORD)
         mail.select('INBOX')
         
-        # 全メール検索
         status, message_ids = mail.search(None, 'ALL')
         
         if status != 'OK' or not message_ids[0]:
@@ -115,8 +257,6 @@ def fetch_recent_emails(limit=50):
             return []
         
         email_ids = message_ids[0].split()
-        
-        # 最新からlimit件取得
         email_ids = email_ids[-limit:] if len(email_ids) > limit else email_ids
         
         emails = []
@@ -130,15 +270,12 @@ def fetch_recent_emails(limit=50):
             raw_email = msg_data[0][1]
             msg = email.message_from_bytes(raw_email)
             
-            # 件名
             subject = decode_mime_header(msg.get('Subject', ''))
             
-            # 送信者
             from_header = msg.get('From', '')
             sender_name, sender_email_addr = email.utils.parseaddr(from_header)
             sender_name = decode_mime_header(sender_name)
             
-            # ★★★ 送信日時を取得（重複防止の要） ★★★
             date_header = msg.get("Date")
             sent_at = ""
             if date_header:
@@ -147,28 +284,112 @@ def fetch_recent_emails(limit=50):
                 except:
                     sent_at = ""
             
-            # 本文取得
+            # 本文取得（強化版）
             body = ''
+            html_body = ''
+            
             if msg.is_multipart():
+                # マルチパートメールの場合
                 for part in msg.walk():
                     content_type = part.get_content_type()
                     content_disposition = str(part.get('Content-Disposition'))
                     
-                    if content_type == 'text/plain' and 'attachment' not in content_disposition:
+                    # 添付ファイルはスキップ
+                    if 'attachment' in content_disposition:
+                        continue
+                    
+                    # テキスト本文を取得
+                    if content_type == 'text/plain':
                         try:
                             payload = part.get_payload(decode=True)
-                            body = payload.decode('utf-8', errors='ignore')
-                            break
+                            if payload:
+                                # エンコーディングを試行
+                                charset = part.get_content_charset() or 'utf-8'
+                                try:
+                                    body = payload.decode(charset, errors='ignore')
+                                except:
+                                    # 複数のエンコーディングを試行
+                                    for encoding in ['utf-8', 'iso-2022-jp', 'shift_jis', 'euc-jp', 'cp932', 'latin-1']:
+                                        try:
+                                            body = payload.decode(encoding, errors='strict')
+                                            break
+                                        except:
+                                            continue
+                                    else:
+                                        # すべて失敗した場合
+                                        body = payload.decode('utf-8', errors='ignore')
+                                
+                                if body.strip():
+                                    break
+                        except Exception as e:
+                            pass
+                    
+                    # HTML本文を取得（テキストがない場合の予備）
+                    elif content_type == 'text/html' and not html_body:
+                        try:
+                            payload = part.get_payload(decode=True)
+                            if payload:
+                                charset = part.get_content_charset() or 'utf-8'
+                                try:
+                                    html_body = payload.decode(charset, errors='ignore')
+                                except:
+                                    for encoding in ['utf-8', 'iso-2022-jp', 'shift_jis', 'euc-jp', 'cp932']:
+                                        try:
+                                            html_body = payload.decode(encoding, errors='strict')
+                                            break
+                                        except:
+                                            continue
+                                    else:
+                                        html_body = payload.decode('utf-8', errors='ignore')
                         except:
                             pass
             else:
+                # シングルパートメールの場合
                 try:
                     payload = msg.get_payload(decode=True)
-                    body = payload.decode('utf-8', errors='ignore')
-                except:
+                    if payload:
+                        content_type = msg.get_content_type()
+                        charset = msg.get_content_charset() or 'utf-8'
+                        
+                        # エンコーディングを試行
+                        try:
+                            body = payload.decode(charset, errors='ignore')
+                        except:
+                            for encoding in ['utf-8', 'iso-2022-jp', 'shift_jis', 'euc-jp', 'cp932']:
+                                try:
+                                    body = payload.decode(encoding, errors='strict')
+                                    break
+                                except:
+                                    continue
+                            else:
+                                body = payload.decode('utf-8', errors='ignore')
+                        
+                        # HTMLの場合はHTMLとして保存
+                        if content_type == 'text/html':
+                            html_body = body
+                            body = ''
+                    else:
+                        body = str(msg.get_payload())
+                except Exception as e:
                     body = str(msg.get_payload())
             
-            # 添付ファイル処理
+            # テキスト本文が空でHTMLがある場合、HTMLからテキストを抽出
+            if not body.strip() and html_body:
+                # HTMLタグを簡易的に除去
+                import re
+                # スクリプトとスタイルを削除
+                html_body = re.sub(r'<script[^>]*?>.*?</script>', '', html_body, flags=re.DOTALL | re.IGNORECASE)
+                html_body = re.sub(r'<style[^>]*?>.*?</style>', '', html_body, flags=re.DOTALL | re.IGNORECASE)
+                # HTMLタグを削除
+                html_body = re.sub(r'<[^>]+>', '', html_body)
+                # HTML実体参照をデコード
+                import html
+                body = html.unescape(html_body)
+                # 余分な空白を削除
+                body = re.sub(r'\n\s*\n', '\n\n', body)
+                body = body.strip()
+            
+
             attachments = []
             for part in msg.walk():
                 if part.get_content_maintype() == 'multipart':
@@ -177,17 +398,48 @@ def fetch_recent_emails(limit=50):
                 filename = part.get_filename()
                 
                 if filename:
-                    filename = decode_mime_header(filename)
+                    # ファイル名のデコード処理を強化
+                    decoded_filename = decode_mime_header(filename)
                     
-                    # Excel拡張子をチェック
-                    if filename.lower().endswith(('.xlsx', '.xls', '.xlsm')):
+                    # 文字化けチェック（�が3文字以上含まれる場合は文字化けとみなす）
+                    is_garbled = decoded_filename.count('�') > 3
+                    
+                    if is_garbled:
+                        # 一旦タイムスタンプ付きの仮ファイル名を使用（後で変更可能）
+                        content_type = part.get_content_type()
+                        ext = '.xlsx'  # デフォルトはxlsx
+                        if 'sheet' in content_type or 'excel' in content_type:
+                            if 'officedocument' in content_type:
+                                ext = '.xlsx'
+                            elif 'macroEnabled' in content_type:
+                                ext = '.xlsm'
+                            else:
+                                ext = '.xls'
+                        
+                        from datetime import datetime
+                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                        decoded_filename = f"temp_{timestamp}{ext}"
+                        print(f"    ⚠️  ファイル名が文字化け → 仮ファイル名: {decoded_filename}")
+                    
+                    if decoded_filename.lower().endswith(('.xlsx', '.xls', '.xlsm')):
                         data = part.get_payload(decode=True)
                         size = len(data) if data else 0
                         
+                        mime_type = part.get_content_type()
+                        if not mime_type or mime_type == 'application/octet-stream':
+                            if decoded_filename.lower().endswith('.xlsx'):
+                                mime_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                            elif decoded_filename.lower().endswith('.xlsm'):
+                                mime_type = 'application/vnd.ms-excel.sheet.macroEnabled.12'
+                            elif decoded_filename.lower().endswith('.xls'):
+                                mime_type = 'application/vnd.ms-excel'
+                        
                         attachments.append({
-                            'filename': filename,
+                            'filename': decoded_filename,
                             'data': data,
-                            'size': size
+                            'size': size,
+                            'mime_type': mime_type,
+                            'is_garbled': is_garbled  # 文字化けフラグを保存
                         })
             
             emails.append({
@@ -196,7 +448,7 @@ def fetch_recent_emails(limit=50):
                 'sender': f"{sender_name} <{sender_email_addr}>",
                 'sender_name': sender_name,
                 'sender_email': sender_email_addr,
-                'sent_at': sent_at,  # ★追加
+                'sent_at': sent_at,
                 'body': body,
                 'attachments': attachments
             })
@@ -214,7 +466,6 @@ def fetch_recent_emails(limit=50):
 def classify_and_extract_with_gemini(email_body, email_subject=""):
     """Gemini APIでメール解析"""
     
-    # プロンプトからmainTextの出力を除外（トークン節約）
     prompt = f"""以下のメールを分析し、その内容が「案件情報（要員募集）」なのか「人材情報（技術者紹介）」なのかを厳密に判断し、該当するJSON形式で返してください。
 
 【メール件名】
@@ -269,9 +520,7 @@ def classify_and_extract_with_gemini(email_body, email_subject=""):
 - エンジニア名は本文中から抽出 (イニシャルのみでも可)
 - 案件と人材が混在している場合は、より主要な方（または最初に記述されている方）を優先してください。"""
     
-    model_names = [
-        'models/gemini-2.0-flash'
-    ]
+    model_names = ['models/gemini-2.0-flash']
     
     import time
     max_retries = 3
@@ -293,14 +542,12 @@ def classify_and_extract_with_gemini(email_body, email_subject=""):
                 response = model.generate_content(prompt, generation_config=generation_config)
                 gemini_text = response.text
                 
-                # JSONクリーニング
                 cleaned_text = re.sub(r'```json\s*', '', gemini_text)
                 cleaned_text = re.sub(r'```\s*', '', cleaned_text)
                 cleaned_text = cleaned_text.strip()
                 
                 extracted = json.loads(cleaned_text)
                 
-                # リスト形式で返ってきた場合の対応
                 if isinstance(extracted, list):
                     if len(extracted) > 0:
                         extracted = extracted[0]
@@ -308,7 +555,6 @@ def classify_and_extract_with_gemini(email_body, email_subject=""):
                         print(f"    ⚠️  {model_name} エラー: 空のリストが返されました")
                         continue
                 
-                # 数値変換
                 if extracted.get('type') == 'project':
                     if extracted.get('price'):
                         try:
@@ -335,7 +581,6 @@ def classify_and_extract_with_gemini(email_body, email_subject=""):
                         except:
                             extracted['age'] = 0
                 
-                # Python側で本文を付与（トークン節約のためプロンプトからは除外）
                 extracted['mainText'] = email_body
                 if not email_body:
                      print("    ⚠️  警告: メール本文が空です")
@@ -348,10 +593,8 @@ def classify_and_extract_with_gemini(email_body, email_subject=""):
                 print(f"    ⚠️  {model_name} JSONパースエラー: {e}")
                 if 'gemini_text' in locals():
                     print(f"    Gemini出力: {gemini_text[:200]}...")
-                # JSONエラーはリトライしても直らない可能性が高いが、念のため次のモデルへ
                 break 
             except Exception as e:
-                # 429エラーなどの場合はリトライ
                 if "429" in str(e) or "quota" in str(e).lower():
                     delay = base_delay * (2 ** attempt)
                     print(f"    ⚠️  レート制限 (429)。{delay}秒後にリトライします... ({attempt+1}/{max_retries})")
@@ -366,14 +609,14 @@ def classify_and_extract_with_gemini(email_body, email_subject=""):
 
 
 def convert_to_bigquery_format(extracted_data, email_subject, fingerprint, sent_at, file_url="", excel_skills=None):
-    """BigQuery形式に変換（fingerprint追加）"""
+    """BigQuery形式に変換"""
     
     data_type = extracted_data.get('type')
     
     if data_type == 'engineer':
         data = {
-            'fingerprint': fingerprint,  # ★追加
-            'sent_at': sent_at,  # ★追加
+            'fingerprint': fingerprint,
+            'sent_at': sent_at,
             'engineer_name': extracted_data.get('engineerName', ''),
             'main_skills': extracted_data.get('mainSkills', ''),
             'years_of_experience': extracted_data.get('yearsOfExperience', 0),
@@ -390,16 +633,15 @@ def convert_to_bigquery_format(extracted_data, email_subject, fingerprint, sent_
             'extracted_at': datetime.now(timezone.utc).isoformat()
         }
         
-        # excel_skills を追加（配列形式）
         if excel_skills:
             data['excel_skills'] = excel_skills
         
         return data
     elif data_type == 'project':
         return {
-            'fingerprint': fingerprint,  # ★追加
-            'sent_at': sent_at,  # ★追加
-            'project_name': email_subject,  # 案件名はメール件名をそのまま使用
+            'fingerprint': fingerprint,
+            'sent_at': sent_at,
+            'project_name': email_subject,
             'location': extracted_data.get('location', ''),
             'period': extracted_data.get('period', ''),
             'price': extracted_data.get('price', 0),
@@ -457,9 +699,7 @@ def extract_skills_from_excel(excel_text):
 - 重複は除外
 - JSON形式のみ出力（説明文不要）"""
     
-    model_names = [
-        'models/gemini-2.0-flash'
-    ]
+    model_names = ['models/gemini-2.0-flash']
     
     for model_name in model_names:
         try:
@@ -476,7 +716,6 @@ def extract_skills_from_excel(excel_text):
             response = model.generate_content(prompt, generation_config=generation_config)
             gemini_text = response.text
             
-            # JSONクリーニング
             cleaned_text = re.sub(r'```json\s*', '', gemini_text)
             cleaned_text = re.sub(r'```\s*', '', cleaned_text)
             cleaned_text = cleaned_text.strip()
@@ -492,18 +731,7 @@ def extract_skills_from_excel(excel_text):
 
 
 def fingerprint_exists(client, table_id, fingerprint):
-    """
-    BigQueryでfingerprintが既に存在するかチェック
-    
-    Args:
-        client: BigQueryクライアント
-        table_id: テーブルID（フルパス）
-        fingerprint: チェックするfingerprint
-    
-    Returns:
-        True: 存在する（重複）
-        False: 存在しない（新規）
-    """
+    """BigQueryでfingerprintが既に存在するかチェック"""
     query = f"""
     SELECT 1
     FROM `{table_id}`
@@ -521,7 +749,6 @@ def fingerprint_exists(client, table_id, fingerprint):
         result = client.query(query, job_config=job_config).result()
         return result.total_rows > 0
     except Exception as e:
-        # テーブルが存在しない場合などはFalseを返す
         print(f"    ⚠️  重複チェックエラー（新規とみなす）: {e}")
         return False
 
@@ -529,14 +756,13 @@ def fingerprint_exists(client, table_id, fingerprint):
 def insert_to_bigquery(data, data_type):
     """BigQueryに挿入"""
     try:
-        client = bigquery.Client(credentials=credentials, project=GCP_PROJECT_ID)
+        client = bigquery.Client(credentials=credentials_bq, project=GCP_PROJECT_ID)
         
         if data_type == 'engineer':
             table_id = f"{GCP_PROJECT_ID}.{BIGQUERY_DATASET}.{BIGQUERY_TABLE_ENGINEERS}"
         else:
             table_id = f"{GCP_PROJECT_ID}.{BIGQUERY_DATASET}.{BIGQUERY_TABLE_PROJECTS}"
         
-        # 新規挿入（重複チェックは呼び出し側で実施済み）
         errors = client.insert_rows_json(table_id, [data])
         
         if errors:
@@ -554,7 +780,7 @@ def main():
     """メイン処理"""
     
     print("=" * 60)
-    print("メール処理統合実行（重複防止機能付き）")
+    print("メール処理統合実行（OAuth版 Google Drive対応）")
     print("=" * 60)
     
     # 最新メール取得
@@ -571,7 +797,7 @@ def main():
     engineer_count = 0
     project_count = 0
     other_count = 0
-    skipped_count = 0  # ★追加
+    skipped_count = 0
     
     for i, email_data in enumerate(emails, 1):
         print(f"\n{'=' * 60}")
@@ -581,7 +807,6 @@ def main():
         print(f"送信者: {email_data['sender']}")
         print(f"送信日時: {email_data['sent_at']}")
         
-        # ★★★ fingerprint生成 ★★★
         fingerprint = generate_mail_fingerprint(
             email_data['sender_email'],
             email_data['subject'],
@@ -590,12 +815,10 @@ def main():
         )
         print(f"fingerprint: {fingerprint[:16]}...")
         
-        # ★★★ 早期重複チェック（Gemini呼び出し前） ★★★
         print("\n  🔍 重複チェック中...")
         try:
-            client = bigquery.Client(credentials=credentials, project=GCP_PROJECT_ID)
+            client = bigquery.Client(credentials=credentials_bq, project=GCP_PROJECT_ID)
             
-            # 両テーブルをチェック
             engineer_table_id = f"{GCP_PROJECT_ID}.{BIGQUERY_DATASET}.{BIGQUERY_TABLE_ENGINEERS}"
             project_table_id = f"{GCP_PROJECT_ID}.{BIGQUERY_DATASET}.{BIGQUERY_TABLE_PROJECTS}"
             
@@ -606,9 +829,7 @@ def main():
                 continue
         except Exception as e:
             print(f"  ⚠️  重複チェックエラー: {e}")
-            # エラー時は処理を続行（安全側に倒す）
         
-        # Gemini解析（重複がない場合のみ実行）
         print("\n  🤖 Gemini解析中...")
         try:
             extracted = classify_and_extract_with_gemini(email_data['body'], email_data['subject'])
@@ -630,40 +851,86 @@ def main():
             other_count += 1
             continue
         
-        # Excel添付ファイル処理（人材メールのみ）
+        file_urls = []
         excel_skills = []
-        if extracted.get('type') == 'engineer' and email_data.get('attachments'):
-            print(f"\n  📎 Excel添付ファイル: {len(email_data['attachments'])}件")
+        
+        if email_data.get('attachments'):
+            print(f"\n  📎 添付ファイル: {len(email_data['attachments'])}件")
             
             for attachment in email_data['attachments']:
-                print(f"    ファイル: {attachment['filename']}")
+                # 文字化けファイルの場合は、Gemini解析結果から適切な名前を生成
+                final_filename = attachment['filename']
                 
-                # Excelをテキスト化
-                excel_text = extract_excel_content(attachment['data'])
-                
-                if excel_text:
-                    print(f"    🤖 Excel解析中...")
-                    excel_data = extract_skills_from_excel(excel_text)
+                if attachment.get('is_garbled') and extracted.get('type') == 'engineer':
+                    # エンジニア情報の場合、イニシャルと最寄駅から名前を生成
+                    engineer_name = extracted.get('engineerName', '')
+                    nearest_station = extracted.get('nearestStation', '')
                     
-                    if excel_data and excel_data.get('excel_skills'):
-                        excel_skills.extend(excel_data['excel_skills'])
-                        print(f"    ✅ スキル抽出: {len(excel_data['excel_skills'])}件")
-                        print(f"       {', '.join(excel_data['excel_skills'][:5])}...")
+                    # ファイル名の生成
+                    if engineer_name and nearest_station:
+                        # 拡張子を取得
+                        ext = '.xlsx'
+                        if final_filename.lower().endswith('.xlsm'):
+                            ext = '.xlsm'
+                        elif final_filename.lower().endswith('.xls'):
+                            ext = '.xls'
+                        
+                        # イニシャルをクリーンアップ（括弧などを除去）
+                        clean_initial = engineer_name.replace('(', '').replace(')', '').replace('（', '').replace('）', '').strip()
+                        # 最寄駅をクリーンアップ
+                        clean_station = nearest_station.replace('駅', '').replace('(', '').replace(')', '').replace('（', '').replace('）', '').strip()
+                        
+                        final_filename = f"{clean_initial}_{clean_station}{ext}"
+                        print(f"    ✨ 文字化けファイル名を修正: {attachment['filename']} → {final_filename}")
+                    elif engineer_name:
+                        # イニシャルのみ
+                        ext = '.xlsx'
+                        if final_filename.lower().endswith('.xlsm'):
+                            ext = '.xlsm'
+                        elif final_filename.lower().endswith('.xls'):
+                            ext = '.xls'
+                        clean_initial = engineer_name.replace('(', '').replace(')', '').replace('（', '').replace('）', '').strip()
+                        final_filename = f"{clean_initial}{ext}"
+                        print(f"    ✨ 文字化けファイル名を修正: {attachment['filename']} → {final_filename}")
+                
+                print(f"    ファイル: {final_filename} ({attachment['size']} bytes)")
+                
+                print(f"    ☁️  Google Driveにアップロード中...")
+                drive_url = upload_to_google_drive(
+                    attachment['data'],
+                    final_filename,  # 修正後のファイル名を使用
+                    attachment.get('mime_type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+                )
+                
+                if drive_url:
+                    file_urls.append(drive_url)
+                
+                if extracted.get('type') == 'engineer':
+                    excel_text = extract_excel_content(attachment['data'])
+                    
+                    if excel_text:
+                        print(f"    🤖 Excel解析中...")
+                        excel_data = extract_skills_from_excel(excel_text)
+                        
+                        if excel_data and excel_data.get('excel_skills'):
+                            excel_skills.extend(excel_data['excel_skills'])
+                            print(f"    ✅ スキル抽出: {len(excel_data['excel_skills'])}件")
+                            print(f"       {', '.join(excel_data['excel_skills'][:5])}...")
         
-        # BigQuery形式に変換（fingerprint追加）
+        file_url_str = ", ".join(file_urls) if file_urls else ""
+        
         bq_data = convert_to_bigquery_format(
             extracted, 
             email_data['subject'],
-            fingerprint,  # ★追加
-            email_data['sent_at'],  # ★追加
-            "",
+            fingerprint,
+            email_data['sent_at'],
+            file_url_str,
             excel_skills if excel_skills else None
         )
         
         if not bq_data:
             continue
         
-        # BigQuery挿入
         print(f"  💾 BigQuery挿入中...")
         success = insert_to_bigquery(bq_data, extracted.get('type'))
         
@@ -678,20 +945,23 @@ def main():
                 print(f"     スキル: {bq_data.get('main_skills')}")
                 if excel_skills:
                     print(f"     Excelスキル: {len(excel_skills)}件")
+                if file_url_str:
+                    print(f"     ファイルURL: {file_url_str}")
             else:
                 project_count += 1
                 print(f"     テーブル: ProjectData")
                 print(f"     案件名: {bq_data.get('project_name')}")
                 print(f"     必須スキル: {bq_data.get('required_skills')}")
+                if file_url_str:
+                    print(f"     ファイルURL: {file_url_str}")
     
-    # 結果サマリー
     print(f"\n{'=' * 60}")
     print("【処理結果】")
     print(f"{'=' * 60}")
     print(f"処理済み: {processed_count}件")
     print(f"  エンジニア情報: {engineer_count}件")
     print(f"  案件情報: {project_count}件")
-    print(f"重複スキップ: {skipped_count}件")  # ★追加
+    print(f"重複スキップ: {skipped_count}件")
     print(f"その他: {other_count}件")
     print(f"{'=' * 60}")
 
