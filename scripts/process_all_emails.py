@@ -1,6 +1,6 @@
 """
-メール処理統合スクリプト（重複防止機能付き + Google Driveアップロード - OAuth版）
-IMAP → Gemini解析 → BigQuery挿入 + 添付ファイルをGoogle Driveに保存
+メール処理統合スクリプト（重複防止機能付き + Google Cloud Storageアップロード）
+IMAP → Gemini解析 → BigQuery挿入 + 添付ファイルをGCSに保存
 """
 import sys
 import os
@@ -13,7 +13,6 @@ import json
 import re
 import hashlib
 from datetime import datetime, timezone
-import pickle
 
 # 環境変数読み込み
 load_dotenv()
@@ -33,79 +32,34 @@ genai.configure(api_key=GOOGLE_API_KEY)
 import openpyxl
 from io import BytesIO
 
-# BigQuery（サービスアカウント認証）
-from google.cloud import bigquery
+# BigQuery & Google Cloud Storage
+from google.cloud import bigquery, storage
 from google.oauth2 import service_account
-
-# Google Drive API（OAuth認証）
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
 
 GCP_PROJECT_ID = os.getenv('GCP_PROJECT_ID', 'gen-lang-client-0092830518')
 BIGQUERY_DATASET = os.getenv('BIGQUERY_DATASET', 'gmailData')
 BIGQUERY_TABLE_ENGINEERS = 'EngineerData'
 BIGQUERY_TABLE_PROJECTS = 'ProjectData'
 
-# Google Drive設定
-GOOGLE_DRIVE_FOLDER_ID = os.getenv('GOOGLE_DRIVE_FOLDER_ID')
+# Google Cloud Storage設定
+GCS_BUCKET_NAME = os.getenv('GCS_BUCKET_NAME')  # 例: email-attachments-oidii
 
-# OAuth認証のスコープ
-SCOPES = ['https://www.googleapis.com/auth/drive.file']
-
-# BigQuery認証（サービスアカウント）
+# 認証（サービスアカウント）
 gcp_json_str = os.getenv('GCP_SERVICE_ACCOUNT_JSON')
 if gcp_json_str:
-    credentials_bq = service_account.Credentials.from_service_account_info(
+    credentials = service_account.Credentials.from_service_account_info(
         json.loads(gcp_json_str)
     )
 else:
     GOOGLE_APPLICATION_CREDENTIALS = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
-    credentials_bq = service_account.Credentials.from_service_account_file(
+    credentials = service_account.Credentials.from_service_account_file(
         GOOGLE_APPLICATION_CREDENTIALS
     )
 
 
-def get_drive_credentials():
+def upload_to_gcs(file_data, filename, mime_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'):
     """
-    Google Drive用のOAuth認証を取得
-    初回実行時はブラウザで認証、2回目以降はtoken.pickleを使用
-    """
-    creds = None
-    
-    # token.pickleファイルがあれば読み込む
-    if os.path.exists('token.pickle'):
-        with open('token.pickle', 'rb') as token:
-            creds = pickle.load(token)
-    
-    # 認証情報が無効または存在しない場合
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            # トークンをリフレッシュ
-            creds.refresh(Request())
-        else:
-            # 新規認証（credentials.jsonが必要）
-            if not os.path.exists('credentials.json'):
-                print("❌ エラー: credentials.jsonファイルが見つかりません")
-                print("Google Cloud Consoleから OAuth 2.0 クライアントIDの認証情報をダウンロードしてください")
-                print("https://console.cloud.google.com/apis/credentials")
-                return None
-            
-            flow = InstalledAppFlow.from_client_secrets_file(
-                'credentials.json', SCOPES)
-            creds = flow.run_local_server(port=0)
-        
-        # 認証情報を保存
-        with open('token.pickle', 'wb') as token:
-            pickle.dump(creds, token)
-    
-    return creds
-
-
-def upload_to_google_drive(file_data, filename, mime_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'):
-    """
-    Google Driveにファイルをアップロードして共有URLを取得（OAuth版）
+    Google Cloud Storageにファイルをアップロードして公開URLを取得
     
     Args:
         file_data: ファイルのバイナリデータ
@@ -113,14 +67,9 @@ def upload_to_google_drive(file_data, filename, mime_type='application/vnd.openx
         mime_type: MIMEタイプ（デフォルトはExcel）
     
     Returns:
-        共有可能なURL（成功時）/ None（失敗時）
+        公開URL（成功時）/ None（失敗時）
     """
     try:
-        # OAuth認証取得
-        creds = get_drive_credentials()
-        if not creds:
-            return None
-        
         # ファイル名をUTF-8で正規化（文字化け対策）
         if isinstance(filename, bytes):
             filename = filename.decode('utf-8', errors='ignore')
@@ -129,58 +78,40 @@ def upload_to_google_drive(file_data, filename, mime_type='application/vnd.openx
         import unicodedata
         filename = unicodedata.normalize('NFC', filename)
         
-        # Drive APIサービス構築
-        drive_service = build('drive', 'v3', credentials=creds)
+        # GCSクライアント構築
+        storage_client = storage.Client(credentials=credentials, project=GCP_PROJECT_ID)
         
-        # ファイルメタデータ
-        file_metadata = {
-            'name': filename,
-            'mimeType': mime_type
-        }
+        # バケット取得
+        bucket = storage_client.bucket(GCS_BUCKET_NAME)
         
-        # アップロード先フォルダを指定する場合
-        if GOOGLE_DRIVE_FOLDER_ID:
-            file_metadata['parents'] = [GOOGLE_DRIVE_FOLDER_ID]
+        # タイムスタンプ付きのパスを生成（重複防止）
+        timestamp = datetime.now().strftime('%Y%m%d')
+        blob_name = f"attachments/{timestamp}/{filename}"
         
-        # ファイルデータをメモリストリームに変換
-        media = MediaIoBaseUpload(
-            BytesIO(file_data),
-            mimetype=mime_type,
-            resumable=True
-        )
+        # Blob作成
+        blob = bucket.blob(blob_name)
         
         # ファイルアップロード
-        file = drive_service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields='id, webViewLink'
-        ).execute()
+        blob.upload_from_string(
+            file_data,
+            content_type=mime_type
+        )
         
-        file_id = file.get('id')
+        # 公開設定
+        blob.make_public()
         
-        # 誰でも閲覧可能に設定（リンクを知っている人全員）
-        permission = {
-            'type': 'anyone',
-            'role': 'reader'
-        }
+        # 公開URL取得
+        public_url = blob.public_url
         
-        drive_service.permissions().create(
-            fileId=file_id,
-            body=permission
-        ).execute()
-        
-        # 共有URL取得
-        web_view_link = file.get('webViewLink')
-        
-        print(f"    ✅ Google Driveアップロード成功")
+        print(f"    ✅ Google Cloud Storageアップロード成功")
         print(f"       ファイル名: {filename}")
-        print(f"       ファイルID: {file_id}")
-        print(f"       URL: {web_view_link}")
+        print(f"       パス: {blob_name}")
+        print(f"       URL: {public_url}")
         
-        return web_view_link
+        return public_url
         
     except Exception as e:
-        print(f"    ❌ Google Driveアップロードエラー: {e}")
+        print(f"    ❌ GCSアップロードエラー: {e}")
         import traceback
         traceback.print_exc()
         return None
@@ -303,12 +234,10 @@ def fetch_recent_emails(limit=50):
                         try:
                             payload = part.get_payload(decode=True)
                             if payload:
-                                # エンコーディングを試行
                                 charset = part.get_content_charset() or 'utf-8'
                                 try:
                                     body = payload.decode(charset, errors='ignore')
                                 except:
-                                    # 複数のエンコーディングを試行
                                     for encoding in ['utf-8', 'iso-2022-jp', 'shift_jis', 'euc-jp', 'cp932', 'latin-1']:
                                         try:
                                             body = payload.decode(encoding, errors='strict')
@@ -316,7 +245,6 @@ def fetch_recent_emails(limit=50):
                                         except:
                                             continue
                                     else:
-                                        # すべて失敗した場合
                                         body = payload.decode('utf-8', errors='ignore')
                                 
                                 if body.strip():
@@ -351,7 +279,6 @@ def fetch_recent_emails(limit=50):
                         content_type = msg.get_content_type()
                         charset = msg.get_content_charset() or 'utf-8'
                         
-                        # エンコーディングを試行
                         try:
                             body = payload.decode(charset, errors='ignore')
                         except:
@@ -364,7 +291,6 @@ def fetch_recent_emails(limit=50):
                             else:
                                 body = payload.decode('utf-8', errors='ignore')
                         
-                        # HTMLの場合はHTMLとして保存
                         if content_type == 'text/html':
                             html_body = body
                             body = ''
@@ -375,21 +301,15 @@ def fetch_recent_emails(limit=50):
             
             # テキスト本文が空でHTMLがある場合、HTMLからテキストを抽出
             if not body.strip() and html_body:
-                # HTMLタグを簡易的に除去
                 import re
-                # スクリプトとスタイルを削除
                 html_body = re.sub(r'<script[^>]*?>.*?</script>', '', html_body, flags=re.DOTALL | re.IGNORECASE)
                 html_body = re.sub(r'<style[^>]*?>.*?</style>', '', html_body, flags=re.DOTALL | re.IGNORECASE)
-                # HTMLタグを削除
                 html_body = re.sub(r'<[^>]+>', '', html_body)
-                # HTML実体参照をデコード
                 import html
                 body = html.unescape(html_body)
-                # 余分な空白を削除
                 body = re.sub(r'\n\s*\n', '\n\n', body)
                 body = body.strip()
             
-
             attachments = []
             for part in msg.walk():
                 if part.get_content_maintype() == 'multipart':
@@ -398,16 +318,12 @@ def fetch_recent_emails(limit=50):
                 filename = part.get_filename()
                 
                 if filename:
-                    # ファイル名のデコード処理を強化
                     decoded_filename = decode_mime_header(filename)
-                    
-                    # 文字化けチェック（�が3文字以上含まれる場合は文字化けとみなす）
                     is_garbled = decoded_filename.count('�') > 3
                     
                     if is_garbled:
-                        # 一旦タイムスタンプ付きの仮ファイル名を使用（後で変更可能）
                         content_type = part.get_content_type()
-                        ext = '.xlsx'  # デフォルトはxlsx
+                        ext = '.xlsx'
                         if 'sheet' in content_type or 'excel' in content_type:
                             if 'officedocument' in content_type:
                                 ext = '.xlsx'
@@ -416,7 +332,6 @@ def fetch_recent_emails(limit=50):
                             else:
                                 ext = '.xls'
                         
-                        from datetime import datetime
                         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                         decoded_filename = f"temp_{timestamp}{ext}"
                         print(f"    ⚠️  ファイル名が文字化け → 仮ファイル名: {decoded_filename}")
@@ -439,7 +354,7 @@ def fetch_recent_emails(limit=50):
                             'data': data,
                             'size': size,
                             'mime_type': mime_type,
-                            'is_garbled': is_garbled  # 文字化けフラグを保存
+                            'is_garbled': is_garbled
                         })
             
             emails.append({
@@ -756,7 +671,7 @@ def fingerprint_exists(client, table_id, fingerprint):
 def insert_to_bigquery(data, data_type):
     """BigQueryに挿入"""
     try:
-        client = bigquery.Client(credentials=credentials_bq, project=GCP_PROJECT_ID)
+        client = bigquery.Client(credentials=credentials, project=GCP_PROJECT_ID)
         
         if data_type == 'engineer':
             table_id = f"{GCP_PROJECT_ID}.{BIGQUERY_DATASET}.{BIGQUERY_TABLE_ENGINEERS}"
@@ -780,8 +695,13 @@ def main():
     """メイン処理"""
     
     print("=" * 60)
-    print("メール処理統合実行（OAuth版 Google Drive対応）")
+    print("メール処理統合実行（GCS版）")
     print("=" * 60)
+    
+    # GCSバケット名の確認
+    if not GCS_BUCKET_NAME:
+        print("❌ エラー: GCS_BUCKET_NAME環境変数が設定されていません")
+        return
     
     # 最新メール取得
     print("\n【最新メール取得中...】")
@@ -817,7 +737,7 @@ def main():
         
         print("\n  🔍 重複チェック中...")
         try:
-            client = bigquery.Client(credentials=credentials_bq, project=GCP_PROJECT_ID)
+            client = bigquery.Client(credentials=credentials, project=GCP_PROJECT_ID)
             
             engineer_table_id = f"{GCP_PROJECT_ID}.{BIGQUERY_DATASET}.{BIGQUERY_TABLE_ENGINEERS}"
             project_table_id = f"{GCP_PROJECT_ID}.{BIGQUERY_DATASET}.{BIGQUERY_TABLE_PROJECTS}"
@@ -862,28 +782,22 @@ def main():
                 final_filename = attachment['filename']
                 
                 if attachment.get('is_garbled') and extracted.get('type') == 'engineer':
-                    # エンジニア情報の場合、イニシャルと最寄駅から名前を生成
                     engineer_name = extracted.get('engineerName', '')
                     nearest_station = extracted.get('nearestStation', '')
                     
-                    # ファイル名の生成
                     if engineer_name and nearest_station:
-                        # 拡張子を取得
                         ext = '.xlsx'
                         if final_filename.lower().endswith('.xlsm'):
                             ext = '.xlsm'
                         elif final_filename.lower().endswith('.xls'):
                             ext = '.xls'
                         
-                        # イニシャルをクリーンアップ（括弧などを除去）
                         clean_initial = engineer_name.replace('(', '').replace(')', '').replace('（', '').replace('）', '').strip()
-                        # 最寄駅をクリーンアップ
                         clean_station = nearest_station.replace('駅', '').replace('(', '').replace(')', '').replace('（', '').replace('）', '').strip()
                         
                         final_filename = f"{clean_initial}_{clean_station}{ext}"
                         print(f"    ✨ 文字化けファイル名を修正: {attachment['filename']} → {final_filename}")
                     elif engineer_name:
-                        # イニシャルのみ
                         ext = '.xlsx'
                         if final_filename.lower().endswith('.xlsm'):
                             ext = '.xlsm'
@@ -895,15 +809,15 @@ def main():
                 
                 print(f"    ファイル: {final_filename} ({attachment['size']} bytes)")
                 
-                print(f"    ☁️  Google Driveにアップロード中...")
-                drive_url = upload_to_google_drive(
+                print(f"    ☁️  Google Cloud Storageにアップロード中...")
+                gcs_url = upload_to_gcs(
                     attachment['data'],
-                    final_filename,  # 修正後のファイル名を使用
+                    final_filename,
                     attachment.get('mime_type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
                 )
                 
-                if drive_url:
-                    file_urls.append(drive_url)
+                if gcs_url:
+                    file_urls.append(gcs_url)
                 
                 if extracted.get('type') == 'engineer':
                     excel_text = extract_excel_content(attachment['data'])

@@ -1,8 +1,6 @@
 google-generativeai
 google-cloud-bigquery
+google-cloud-storage
 openpyxl
 python-dotenv
 google-auth
-google-api-python-client
-google-auth-httplib2
-google-auth-oauthlib
