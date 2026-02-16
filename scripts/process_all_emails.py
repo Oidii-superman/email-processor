@@ -170,7 +170,7 @@ def decode_mime_header(header_text):
     return decoded_text
 
 
-def fetch_recent_emails(limit=50):
+def fetch_recent_emails(limit=200):
     """最新メールを50件取得（既読・未読問わず）+ 送信日時を取得"""
     try:
         mail = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
@@ -331,7 +331,7 @@ def fetch_recent_emails(limit=50):
                         
                         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                         decoded_filename = f"temp_{timestamp}{ext}"
-                        print(f"    ⚠️  ファイル名が文字化け → 仮ファイル名: {decoded_filename}")
+                        print(f"ファイル名が文字化け → 仮ファイル名: {decoded_filename}")
                     
                     if decoded_filename.lower().endswith(('.xlsx', '.xls', '.xlsm')):
                         data = part.get_payload(decode=True)
@@ -371,7 +371,7 @@ def fetch_recent_emails(limit=50):
         return emails
         
     except Exception as e:
-        print(f"❌ メール取得エラー: {e}")
+        print(f"メール取得エラー: {e}")
         return []
 
 
@@ -584,7 +584,7 @@ def extract_excel_content(excel_data):
         return '\n'.join(all_text)
         
     except Exception as e:
-        print(f"    ❌ Excel読み込みエラー: {e}")
+        print(f"Excel読み込みエラー: {e}")
         return None
 
 
@@ -661,7 +661,7 @@ def fingerprint_exists(client, table_id, fingerprint):
         result = client.query(query, job_config=job_config).result()
         return result.total_rows > 0
     except Exception as e:
-        print(f"    ⚠️  重複チェックエラー（新規とみなす）: {e}")
+        print(f" 重複チェックエラー（新規とみなす）: {e}")
         return False
 
 
@@ -678,13 +678,13 @@ def insert_to_bigquery(data, data_type):
         errors = client.insert_rows_json(table_id, [data])
         
         if errors:
-            print(f"  ❌ BigQuery挿入エラー: {errors}")
+            print(f"BigQuery挿入エラー: {errors}")
             return False
         else:
             return True
             
     except Exception as e:
-        print(f"  ❌ BigQuery接続エラー: {e}")
+        print(f"BigQuery接続エラー: {e}")
         return False
 
 
@@ -697,12 +697,12 @@ def main():
     
     # GCSバケット名の確認
     if not GCS_BUCKET_NAME:
-        print("❌ エラー: GCS_BUCKET_NAME環境変数が設定されていません")
+        print("エラー: GCS_BUCKET_NAME環境変数が設定されていません")
         return
     
     # 最新メール取得
     print("\n【最新メール取得中...】")
-    emails = fetch_recent_emails(limit=50)
+    emails = fetch_recent_emails(limit=200)
     
     if not emails:
         print("メールは見つかりませんでした")
@@ -741,27 +741,27 @@ def main():
             
             if fingerprint_exists(client, engineer_table_id, fingerprint) or \
                fingerprint_exists(client, project_table_id, fingerprint):
-                print(f"  ⏭️  既処理メール（fingerprint一致）- Gemini呼び出しスキップ")
+                print(f"既処理メール（fingerprint一致）- Gemini呼び出しスキップ")
                 skipped_count += 1
                 continue
         except Exception as e:
-            print(f"  ⚠️  重複チェックエラー: {e}")
+            print(f"重複チェックエラー: {e}")
         
-        print("\n  🤖 Gemini解析中...")
+        print("\n Gemini解析中...")
         try:
             extracted = classify_and_extract_with_gemini(email_data['body'], email_data['subject'])
             
             if not extracted:
-                print("  ❌ 解析失敗: Geminiがレスポンスを返しませんでした")
-                print(f"  メール本文（最初の200文字）: {email_data['body'][:200]}...")
+                print(" 解析失敗: Geminiがレスポンスを返しませんでした")
+                print(f"メール本文（最初の200文字）: {email_data['body'][:200]}...")
                 continue
         except Exception as e:
-            print(f"  ❌ 解析エラー: {e}")
+            print(f" 解析エラー: {e}")
             import traceback
             traceback.print_exc()
             continue
         
-        print(f"  ✅ 判定: {extracted.get('type')}")
+        print(f" 判定: {extracted.get('type')}")
         
         if extracted.get('type') == 'other':
             print("  → その他メール（スキップ）")
@@ -772,7 +772,7 @@ def main():
         excel_skills = []
         
         if email_data.get('attachments'):
-            print(f"\n  📎 添付ファイル: {len(email_data['attachments'])}件")
+            print(f"\n 添付ファイル: {len(email_data['attachments'])}件")
             
             for attachment in email_data['attachments']:
                 # 文字化けファイルの場合は、Gemini解析結果から適切な名前を生成
@@ -793,7 +793,7 @@ def main():
                         clean_station = nearest_station.replace('駅', '').replace('(', '').replace(')', '').replace('（', '').replace('）', '').strip()
                         
                         final_filename = f"{clean_initial}_{clean_station}{ext}"
-                        print(f"    ✨ 文字化けファイル名を修正: {attachment['filename']} → {final_filename}")
+                        print(f" 文字化けファイル名を修正: {attachment['filename']} → {final_filename}")
                     elif engineer_name:
                         ext = '.xlsx'
                         if final_filename.lower().endswith('.xlsm'):
@@ -802,11 +802,11 @@ def main():
                             ext = '.xls'
                         clean_initial = engineer_name.replace('(', '').replace(')', '').replace('（', '').replace('）', '').strip()
                         final_filename = f"{clean_initial}{ext}"
-                        print(f"    ✨ 文字化けファイル名を修正: {attachment['filename']} → {final_filename}")
+                        print(f" 文字化けファイル名を修正: {attachment['filename']} → {final_filename}")
                 
                 print(f"    ファイル: {final_filename} ({attachment['size']} bytes)")
                 
-                print(f"    ☁️  Google Cloud Storageにアップロード中...")
+                print(f" Google Cloud Storageにアップロード中...")
                 gcs_url = upload_to_gcs(
                     attachment['data'],
                     final_filename,
@@ -820,12 +820,12 @@ def main():
                     excel_text = extract_excel_content(attachment['data'])
                     
                     if excel_text:
-                        print(f"    🤖 Excel解析中...")
+                        print(f" Excel解析中...")
                         excel_data = extract_skills_from_excel(excel_text)
                         
                         if excel_data and excel_data.get('excel_skills'):
                             excel_skills.extend(excel_data['excel_skills'])
-                            print(f"    ✅ スキル抽出: {len(excel_data['excel_skills'])}件")
+                            print(f" スキル抽出: {len(excel_data['excel_skills'])}件")
                             print(f"       {', '.join(excel_data['excel_skills'][:5])}...")
         
         file_url_str = ", ".join(file_urls) if file_urls else ""
@@ -842,11 +842,11 @@ def main():
         if not bq_data:
             continue
         
-        print(f"  💾 BigQuery挿入中...")
+        print(f" BigQuery挿入中...")
         success = insert_to_bigquery(bq_data, extracted.get('type'))
         
         if success:
-            print(f"  ✅ 挿入成功")
+            print(f" 挿入成功")
             processed_count += 1
             
             if extracted.get('type') == 'engineer':
