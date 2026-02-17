@@ -14,6 +14,14 @@ import re
 import hashlib
 from datetime import datetime, timezone
 
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+def safe_print(msg):
+    if LOG_LEVEL == "DEBUG":
+        print(msg)
+
+def prod_log(msg):
+    print(msg)
 # 環境変数読み込み
 load_dotenv()
 
